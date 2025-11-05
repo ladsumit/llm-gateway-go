@@ -2,12 +2,32 @@ package main
 
 import (
 	"bytes"
-	"encoding/json" // New import for JSON handling
+	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"sync"
 	"time"
+)
+
+// LLMUsageMetrics holds all global, thread-safe metrics for the gateway.
+type LLMUsageMetrics struct {
+	TotalRequests int            `json:"totalRequests"`
+	TotalCost     float64        `json:"totalCostUsd"`
+	ModelUsage    map[string]int `json:"modelUsageCount"` // Maps model name to request count
+}
+
+var (
+	// metricsMutex protects the globalMetrics struct from concurrent access
+	metricsMutex sync.Mutex
+	// globalMetrics is the single source of truth for all usage data
+	globalMetrics = LLMUsageMetrics{
+		TotalRequests: 0,
+		TotalCost:     0.0,
+		ModelUsage:    make(map[string]int),
+	}
 )
 
 // --- CONFIGURATION ---
@@ -18,6 +38,14 @@ const expensiveModelURL = "http://localhost:8082/v1/chat/completions" // Target:
 
 // Define your API Key environment variable name
 const apiKeyEnv = "LLM_GATEWAY_API_KEY"
+
+const promptLengthThreshold = 150 // Prompts longer than 150 characters are routed to the Expensive model.
+
+// Define cost estimates (as a proxy for token usage)
+const (
+	cheapModelCostPerChar     = 0.0000001 // $0.10 per million characters
+	expensiveModelCostPerChar = 0.0000015 // $1.50 per million characters
+)
 
 // --- REQUEST BODY STRUCTURES ---
 
@@ -34,38 +62,39 @@ type RequestPayload struct {
 
 // --- INTELLIGENCE CORE ---
 
-// analyzePrompt inspects the request body and selects the appropriate LLM target.
-// It uses prompt length as a proxy for complexity.
-func analyzePrompt(bodyBytes []byte) (targetURL, modelName string) {
-	// Default to the cheap, fast model
-	targetURL = cheapModelURL
-	modelName = "CheapModel"
-
-	// Unmarshal the JSON request body
+// getPromptLength processes the raw request body to determine the total length of the user's prompt.
+func getPromptLength(bodyBytes []byte) (int, error) {
 	var payload RequestPayload
 	if err := json.Unmarshal(bodyBytes, &payload); err != nil {
-		// Log a warning if unmarshalling fails, but proceed with the default cheap model
-		log.Printf("! WARN: Failed to unmarshal request body: %v. Defaulting to CheapModel.", err)
-		return targetURL, modelName
+		// Using fmt.Errorf allows us to wrap the original error for better debugging
+		return 0, fmt.Errorf("failed to unmarshal JSON request body: %w", err)
 	}
 
-	// Calculate total prompt length from all messages
 	totalLength := 0
-	for _, msg := range payload.Messages {
-		totalLength += len(msg.Content)
+	// Calculate the total content length from all user messages
+	for _, message := range payload.Messages {
+		if message.Role == "user" {
+			// Using len(message.Content) is a simple character count proxy for token usage.
+			totalLength += len(message.Content)
+		}
 	}
+	return totalLength, nil
+}
 
-	// Rule-Based Routing Logic:
-	// Prompts longer than 150 characters are deemed 'complex' and routed to the
-	// slower, more capable (mocked) ExpensiveModel.
-	const complexityThreshold = 150
+// MetricsHandler serves the current usage and cost metrics in JSON format.
+func MetricsHandler(w http.ResponseWriter, r *http.Request) {
+	// Lock the mutex to ensure we read a consistent snapshot of the data
+	metricsMutex.Lock()
+	// IMPORTANT: Defer the Unlock call to ensure the lock is always released
+	defer metricsMutex.Unlock()
 
-	if totalLength > complexityThreshold {
-		targetURL = expensiveModelURL
-		modelName = "ExpensiveModel"
+	w.Header().Set("Content-Type", "application/json")
+
+	// Encode the global metrics struct into the HTTP response body
+	if err := json.NewEncoder(w).Encode(globalMetrics); err != nil {
+		log.Printf("! ERR: Failed to encode metrics JSON: %v", err)
+		http.Error(w, "Failed to encode metrics", http.StatusInternalServerError)
 	}
-
-	return targetURL, modelName
 }
 
 // --- CORE HANDLER ---
@@ -88,17 +117,48 @@ func LLMProxyHandler(w http.ResponseWriter, r *http.Request) {
 	// Restore the body (r.Body is consumed by io.ReadAll)
 	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 
-	// 2. Initial Logging
-	log.Printf("-> REQ: Received request from %s | Body Size: %d bytes\n", r.RemoteAddr, len(bodyBytes))
+	// 2. Analyze Prompt Content to Determine Routing
+	totalPromptLength, err := getPromptLength(bodyBytes)
+	if err != nil {
+		// CRITICAL FIX: If the payload is bad, we must abort here.
+		log.Printf("! ERR: Failed to analyze prompt body: %v\n", err)
+		http.Error(w, "Invalid request format: must be a valid chat completion JSON payload", http.StatusBadRequest)
+		return
+	}
 
 	// 3. MODEL SELECTION (Intelligent Routing Logic)
-	// The core logic is here: inspect the body and choose the destination.
-	targetURL, modelName := analyzePrompt(bodyBytes)
+	var targetURL string
+	var modelName string
+	var costPerChar float64
 
-	log.Printf("-> ROUTE: Routing to %s at %s\n", modelName, targetURL)
+	if totalPromptLength <= promptLengthThreshold {
+		targetURL = cheapModelURL
+		modelName = "CheapModel"
+		costPerChar = cheapModelCostPerChar
+	} else {
+		targetURL = expensiveModelURL
+		modelName = "ExpensiveModel"
+		costPerChar = expensiveModelCostPerChar
+	}
 
-	// 4. Create the Upstream Request
-	// The body is read from the buffer created in step 1, ensuring we can read it again.
+	// Calculate Estimated Cost
+	estimatedCost := float64(totalPromptLength) * costPerChar
+
+	// 4. Logging & Authorization Setup (Combined for clarity)
+	log.Printf("-> REQ: Received request from %s | Prompt Size: %d chars", r.RemoteAddr, totalPromptLength)
+	log.Printf("-> ROUTE: Prompt size (%d) <= %d? %t. Routing to %s (Est. Cost: $%.6f)\n",
+		totalPromptLength, promptLengthThreshold, totalPromptLength <= promptLengthThreshold, modelName, estimatedCost)
+
+	// Determine Authorization and Content-Type headers for upstream calls
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		if apiKey := os.Getenv(apiKeyEnv); apiKey != "" {
+			authHeader = "Bearer " + apiKey
+		}
+	}
+	contentType := r.Header.Get("Content-Type")
+
+	// 5. Create the Upstream Request
 	proxyReq, err := http.NewRequest(r.Method, targetURL, bytes.NewReader(bodyBytes))
 	if err != nil {
 		log.Printf("! ERR: Failed to create proxy request: %v\n", err)
@@ -108,26 +168,22 @@ func LLMProxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Copy essential headers
 	proxyReq.Header = make(http.Header)
-	// Handle API Key authorization
-	if r.Header.Get("Authorization") != "" {
-		proxyReq.Header.Set("Authorization", r.Header.Get("Authorization"))
-	} else if apiKey := os.Getenv(apiKeyEnv); apiKey != "" {
-		proxyReq.Header.Set("Authorization", "Bearer "+apiKey)
+	if authHeader != "" {
+		proxyReq.Header.Set("Authorization", authHeader)
 	}
+	proxyReq.Header.Set("Content-Type", contentType)
 
-	proxyReq.Header.Set("Content-Type", r.Header.Get("Content-Type"))
-
-	// 5. Execute the Request
+	// 6. Execute the Request
 	client := &http.Client{Timeout: 30 * time.Second} // Client with a timeout
 	resp, err := client.Do(proxyReq)
 	if err != nil {
 		log.Printf("! ERR: Failed to execute upstream request to %s: %v\n", targetURL, err)
-		http.Error(w, "Error connecting to LLM endpoint", http.StatusBadGateway)
+		http.Error(w, fmt.Sprintf("Error connecting to %s endpoint", modelName), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
-	// 6. Return Response to Client
+	// 7. Return Response to Client & Update Metrics
 	// Copy upstream status and headers
 	w.WriteHeader(resp.StatusCode)
 	for name, values := range resp.Header {
@@ -138,21 +194,32 @@ func LLMProxyHandler(w http.ResponseWriter, r *http.Request) {
 	responseSize, err := io.Copy(w, resp.Body)
 	if err != nil {
 		log.Printf("! ERR: Failed to copy response body back: %v\n", err)
-		// Logging internal error only
 	}
 
-	// 7. Final Logging & Performance Metric
-	log.Printf("<- RSP: Model: %s | Status: %d | Time: %s | Size: %d bytes\n",
-		modelName, resp.StatusCode, time.Since(start), responseSize)
+	// Update Metrics (Thread-safe operation)
+	metricsMutex.Lock()
+	globalMetrics.TotalRequests++
+	globalMetrics.TotalCost += estimatedCost
+	globalMetrics.ModelUsage[modelName]++
+	metricsMutex.Unlock()
+
+	// 8. Final Logging & Performance Metric
+	log.Printf("<- RSP: Model: %s | Cost Est: $%.6f | Status: %d | Time: %s | Size: %d bytes\n",
+		modelName, estimatedCost, resp.StatusCode, time.Since(start), responseSize)
 }
 
 func main() {
+	// Initialize map for ModelUsage
+	globalMetrics.ModelUsage["CheapModel"] = 0
+	globalMetrics.ModelUsage["ExpensiveModel"] = 0
+
 	// Set up the router
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", LLMProxyHandler)
+	mux.HandleFunc("/metrics", MetricsHandler)
 
 	port := ":8080"
-	log.Printf("✅ LLM Gateway (Intelligent Router) starting on http://localhost%s\n", port)
+	log.Printf("✅ LLM Gateway (Prompt-Size Router & Metrics) starting on http://localhost%s\n", port)
 
 	// Start the server
 	if err := http.ListenAndServe(port, mux); err != nil {
